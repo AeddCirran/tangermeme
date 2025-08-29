@@ -76,11 +76,12 @@ def _predict_grad(
 
     Returns
     -------
-    y_grad: torch.Tensor, shape=(-1, len(alphabet), length)
+    grads: torch.Tensor, shape=(-1, len(alphabet), length)
             The gradients of the model for each input example.
     """
 
     model = model.to(device).eval()
+    scaler = torch.amp.GradScaler()
 
     if dtype is None:
         try:
@@ -100,55 +101,53 @@ def _predict_grad(
 
     ###
 
-    y_grad = []
+    grads = []
+
     with torch.autograd.set_grad_enabled(True):
         batch_size = min(batch_size, X.shape[0])
 
         for start in trange(0, X.shape[0], batch_size, disable=not verbose):
             end = start + batch_size
-            X_ = X[start:end].type(dtype).to(device).requires_grad_()
+            X_ = X[start:end].clone().type(dtype).to(device).requires_grad_()
 
             if X_.shape[0] == 0:
                 continue
 
             with torch.autocast(device_type=device, dtype=dtype):
                 if args is not None:
-                    args_ = [a[start:end].type(dtype).to(device) for a in args]
-                    y_ = model(X_, *args_)
+                    args_ = [a[start:end].clone().type(dtype).to(device) for a in args]
+                    y_ = model(X_, *args_)[:, target]
                 else:
-                    y_ = model(X_)
+                    y_ = model(X_)[:, target]
 
-                y_target = y_[:, target]
-
-                if len(y_target.shape) > 1:
-                    y_target = torch.mean(
-                        y_target, dim=tuple(range(1, len(y_target.shape)))
+                if len(y_.shape) > 1:
+                    y_ = torch.mean(
+                        y_, dim=tuple(range(1, len(y_.shape)))
                     )
 
-                y_target_like = torch.ones_like(y_target)
-                y_grad_ = (
-                    torch.autograd.grad(y_target, X_, grad_outputs=y_target_like)[0]
-                    .detach()
-                    .cpu()
-                )
+                y_like = torch.ones_like(y_)
+                y_scaled = scaler.scale(y_)
 
-            y_grad.append(y_grad_)
+                y_grad_scaled = torch.autograd.grad(y_scaled, X_, grad_outputs=y_like)[0]
 
-    y_grad = torch.cat(y_grad)
-    return y_grad
+                y_grad = y_grad_scaled/scaler.get_scale()
+                grads.append(y_grad.detach().cpu())  
+
+    grads = torch.cat(grads)
+    return grads
 
 
-def _attribution_score(y_hat_grad):
+def _attribution_score(grads):
     """An internal function for calculating the TISM attributions.
 
     This function, which is meant to be used for TISM, will take in the
-    gradients and return TISM attributions.
+    gradients and return the position-normalized differences.
 
 
     Parameters
     ----------
-    y_hat_grad: torch.Tensor, shape=(-1, (end-start), len(alphabet), length)
-            Model gradients for each example for each substitution.
+    grads: torch.Tensor, shape=(-1, len(alphabet), length)
+            Model gradients for each input example.
 
 
     Returns
@@ -157,56 +156,15 @@ def _attribution_score(y_hat_grad):
             The TISM attributions for each input example.
     """
 
-    attr = torch.mean(y_hat_grad, dim=1)
-    attr -= torch.sum(attr, dim=1, keepdims=True)
+    attr = grads - torch.mean(grads, dim=1, keepdims=True)
 
     return attr
-
-
-def _edit_distance_one(X, start, end):
-    """An internal function for generating all sequences of edit distance 1
-
-    This internal function, which is meant to be used for TISM, will take in a
-    one-hot encoded sequence and return all sequences that have an edit
-    distance of one.
-
-
-    Parameters
-    ----------
-    X: torch.Tensor, shape=(len(alphabet), sequence_length)
-            A single one-hot encoded sequence.
-
-    start: int
-            The first nucleotide to begin making edits on, inclusive.
-
-    end: int
-            The end of the span. Edits are not made on this nucleotide at this
-            index. Can be negative indexes.
-
-
-    Returns
-    -------
-    X_: torch.Tensor, shape=(length, len(alphabet), length)
-            All one-hot encoded sequences that have an edit distance of 1 from
-            the original sequence.
-    """
-
-    end = end if end >= 0 else X.shape[-1] + 1 + end
-    X_ = X.repeat((end - start), 1, 1)
-
-    coords = range(start, end)
-    for i, k in enumerate(coords):
-        X_[i, :, k] = 0
-
-    return X_
 
 
 def tism(
     model,
     X,
     args=None,
-    start=0,
-    end=-1,
     batch_size=32,
     target=None,
     hypothetical=False,
@@ -215,21 +173,23 @@ def tism(
     device="cuda",
     verbose=False,
 ):
-    """Performs Taylor in-silico saturation mutagenesis on a set of sequences.
+    """Performs Taylor approximated in-silico saturation mutagenesis on a
+    set of sequences.
 
-    This function will perform Taylor in-silico saturation mutagenesis on a
-    set of sequences and return the gradients for the original sequences and
-    each of the sequences with an edit distance of one on them.
+    This function will perform Taylor approximated in-silico saturation
+    mutagenesis on a set of sequences and return the gradients for the original
+    sequences.
 
     By default, this function will aggregate these gradients into an
-    attribution value. However, this assumes that the model returns only a
+    attribution value. This agregation involves normalizing them across the
+    entire example. However, this assumes that the model returns only a
     single tensor. This tensor can have multiple outputs, e.g., be of shape
     (batch_size, n_targets) where n_targets > 1, but the model cannot return
     multiple tensors.
 
-    If you simply want the gradients after the substitutions
-    without the method turning those into attributions because, perhaps, you
-    want to define your own aggregation method, you can use `raw_outputs=True`.
+    If you simply want the gradients without the method turning those into
+    attributions because, perhaps, you want to define your own aggregation
+    method, you can use `raw_outputs=True`.
 
 
     Parameters
@@ -248,15 +208,6 @@ def tism(
             as `X`. If None, no additional arguments are passed into the
             forward function. Default is None.
 
-    start: int, optional
-            The start of where to begin making perturbations to the sequence.
-            Default is 0.
-
-    end: int, optional
-            The end of where to to make perturbations to the sequence. If end
-            is positive, it is non-inclusive. If end is negative, it is
-            inclusive. Default is -1, meaning the entire sequence.
-
     batch_size: int, optional
             The number of examples to calculate gradients for at a time.
             Default is 32.
@@ -274,8 +225,8 @@ def tism(
 
     raw_outputs: bool, optional
             Whether to return the raw outputs from the method -- in this case,
-            the gradients from each of the perturbations -- or the processed
-            attribution values. Default is False.
+            the gradients -- or the processed attribution values. 
+            Default is False.
 
     dtype: str or torch.dtype or None, optional
             The dtype to use with mixed precision autocasting. If None,
@@ -300,28 +251,14 @@ def tism(
 
     -- or, if raw_outputs=True --
 
-    y_hat_grad: torch.Tensor, shape=(-1, (end-start), len(alphabet), length)
-            The gradients from the model for each of the perturbed sequences.
+    grads: torch.Tensor, shape=(-1, len(alphabet), length)
+            The gradients from the model for each of the input sequences.
     """
 
-    if end < 0:
-        end = X.shape[-1] + 1 + end
-
-    y_hat_grad = []
-    for i in range(X.shape[0]):
-        X_ = _edit_distance_one(X[i], start, end)
-
-        if args is not None:
-            args_ = tuple(
-                a[i].repeat(X_.shape[0], *(1 for _ in a[i].shape)) for a in args
-            )
-        else:
-            args_ = None
-
-        y_hat_grad_ = _predict_grad(
+    grads = _predict_grad(
             model,
-            X_,
-            args=args_,
+            X,
+            args=args,
             batch_size=batch_size,
             target=target,
             dtype=dtype,
@@ -329,15 +266,9 @@ def tism(
             verbose=verbose,
         )
 
-        y_hat_grad.append(y_hat_grad_)
-
-    y_hat_grad = torch.stack(y_hat_grad).reshape(
-        X.shape[0], end - start, *y_hat_grad_.shape[1:]
-    )
-
     if raw_outputs is False:
-        attr = _attribution_score(y_hat_grad)
+        attr = _attribution_score(grads)
 
         return X * attr if hypothetical is False else attr
 
-    return y_hat_grad
+    return grads
