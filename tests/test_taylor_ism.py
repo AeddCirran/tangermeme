@@ -7,20 +7,14 @@ import pytest
 
 from tangermeme.utils import random_one_hot
 
+from .toy_models import SumModel
+from .toy_models import FlattenDense
+from .toy_models import Conv
+from .toy_models import Scatter
+from .toy_models import ConvDense
+from .toy_models import SmallDeepSEA
+
 import sys
-import os
-
-module_path = "../tests"
-
-if module_path not in sys.path:
-    sys.path.insert(0, module_path)
-
-from toy_models import SumModel
-from toy_models import FlattenDense
-from toy_models import Conv
-from toy_models import Scatter
-from toy_models import ConvDense
-from toy_models import SmallDeepSEA
 
 module_path = "../tangermeme"
 
@@ -64,7 +58,7 @@ class LambdaWrapper(torch.nn.Module):
     """Wrapper that runs a given forward function instead of the default.
 
     Several of the classes in toy_models.py return multiple outputs but the
-    attributions from deep_lift_shap require that there's only one output per
+    attributions from taylor_ism require that there's only one output per
     example to explain. This class helps overcome the issues with having
     multiple outputs by slicing out the output we're interested in.
 
@@ -75,9 +69,9 @@ class LambdaWrapper(torch.nn.Module):
             A PyTorch model that we want to use.
 
     forward: function
-            A function that takes in a model and a batch of sequences and returns
-            some output. Usually this is just running the forward function of the
-            model and then slicing out an output.
+            A function that takes in a model and a batch of sequences and
+            returns some output. Usually this is just running the forward
+            function of the model and then slicing out an output.
     """
 
     def __init__(self, model, forward):
@@ -89,7 +83,7 @@ class LambdaWrapper(torch.nn.Module):
         return self._forward(self.model, X, *args)
 
 
-def test_predict_summodel(X):
+def test_grad_summodel(X):
     torch.manual_seed(0)
     model = SumModel()
     y = _predict_grad(model, X, batch_size=8, device="cpu")
@@ -131,7 +125,7 @@ def test_predict_summodel(X):
     assert_array_almost_equal(y, _predict_grad(model, X, batch_size=64, device="cpu"))
 
 
-def test_predict_flattendense(X):
+def test_grad_flattendense(X):
     torch.manual_seed(0)
     model = FlattenDense()
     y = _predict_grad(model, X, batch_size=8, device="cpu")
@@ -174,7 +168,7 @@ def test_predict_flattendense(X):
     assert_array_almost_equal(y, _predict_grad(model, X, batch_size=64, device="cpu"))
 
 
-def test_predict_conv(X):
+def test_grad_conv(X):
     torch.manual_seed(0)
     model = Conv()
     y = _predict_grad(model, X, batch_size=8, device="cpu")
@@ -217,7 +211,7 @@ def test_predict_conv(X):
     assert_array_almost_equal(y, _predict_grad(model, X, batch_size=64, device="cpu"))
 
 
-def test_predict_scatter(X):
+def test_grad_scatter(X):
     torch.manual_seed(0)
     model = Scatter()
     y = _predict_grad(model, X, batch_size=8, device="cpu")
@@ -261,7 +255,7 @@ def test_predict_scatter(X):
     assert_array_almost_equal(y, _predict_grad(model, X, batch_size=64, device="cpu"))
 
 
-def test_predict_convdense_dense_wrapper(X):
+def test_grad_convdense_dense_wrapper(X):
     torch.manual_seed(0)
     model = LambdaWrapper(ConvDense(), lambda model, X: model(X)[1])
     y = _predict_grad(model, X, batch_size=2, device="cpu")
@@ -306,7 +300,7 @@ def test_predict_convdense_dense_wrapper(X):
     assert y.dtype == torch.float32
 
 
-def test_predict_convdense_conv_wrapper(X):
+def test_grad_convdense_conv_wrapper(X):
     torch.manual_seed(0)
     model = LambdaWrapper(ConvDense(), lambda model, X: model(X)[0])
     y = _predict_grad(model, X, batch_size=2, device="cpu")
@@ -351,14 +345,14 @@ def test_predict_convdense_conv_wrapper(X):
     assert y.dtype == torch.float32
 
 
-def test_predict_batch_size(X):
+def test_grad_batch_size(X):
     torch.manual_seed(0)
     model = Scatter()
     y = _predict_grad(model, X, batch_size=68, device="cpu")
     assert y.shape == (64, 4, 100)
 
 
-def test_predict_raises_shape(X):
+def test_grad_raises_shape(X):
     torch.manual_seed(0)
     model = Scatter()
     assert_raises(RuntimeError, _predict_grad, model, X[0], device="cpu")
@@ -366,7 +360,7 @@ def test_predict_raises_shape(X):
     assert_raises(RuntimeError, _predict_grad, model, X.unsqueeze(0), device="cpu")
 
 
-def test_predict_raises_args(X, alpha, beta):
+def test_grad_raises_args(X, alpha, beta):
     torch.manual_seed(0)
     model = FlattenDense()
     assert_raises(
